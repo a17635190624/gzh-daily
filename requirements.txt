@@ -1,0 +1,4 @@
+# 公众号日更 · 云端流水线依赖
+requests>=2.31.0
+openai>=1.0.0          # DeepSeek API 兼容 OpenAI SDK
+dashscope>=1.20.0      # 通义万相（图片生成）

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# 产物（云端版本提交到 git，便于回看历史；如不想提交可取消注释）
+# articles/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.swp
+
+# 编辑器
+.idea/
+.vscode/
+*.iml
+
+# 日志
+*.log
