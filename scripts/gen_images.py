@@ -18,9 +18,11 @@ from pathlib import Path
 import urllib.request
 import urllib.error
 import json as jsonlib
+from io import BytesIO
 
 import dashscope
 from dashscope import ImageSynthesis
+from PIL import Image
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -65,26 +67,70 @@ def parse_md_for_image_prompts(date: str) -> dict:
     }
 
 
-def gen_one_image(api_key: str, prompt: str, size: str, out_path: Path, n: int = 1):
-    """调通义万相生成一张图"""
+def gen_one_image(api_key: str, prompt: str, size: str, out_path: Path,
+                  target_w: int = 0, target_h: int = 0, n: int = 1):
+    """调通义万相生成一张图（异步两段式），并按目标比例居中裁剪缩放"""
     dashscope.api_key = api_key
 
-    print(f"  🎨 生成 {out_path.name} ({size})...")
+    print(f"  🎨 生成 {out_path.name}（接口尺寸 {size}）...")
+    # wanx-v1 为异步模型：call() 只创建任务并返回 task_id
     rsp = ImageSynthesis.call(
         model="wanx-v1",
         prompt=prompt,
         n=n,
         size=size,
-        steps=30,
     )
 
     if rsp.status_code != 200:
         print(f"❌ 生成失败：{rsp.code} - {rsp.message}")
         sys.exit(1)
 
-    url = rsp.output.results[0].url
-    urllib.request.urlretrieve(url, str(out_path))
+    # 若返回了 task_id，需要 wait 轮询等待结果
+    task_id = getattr(rsp.output, "task_id", None)
+    if task_id:
+        print(f"    任务已提交（{task_id}），等待生成...")
+        rsp = ImageSynthesis.wait(task_id)
+        if rsp.status_code != 200:
+            print(f"❌ 任务失败：{rsp.code} - {rsp.message}")
+            sys.exit(1)
+
+    results = getattr(rsp.output, "results", None)
+    if not results:
+        print(f"❌ 未返回图片结果（code={rsp.code} message={rsp.message}）")
+        sys.exit(1)
+
+    url = results[0].url
+    print(f"    下载图片...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    img_data = urllib.request.urlopen(req, timeout=120).read()
+
+    img = Image.open(BytesIO(img_data)).convert("RGB")
+
+    # 若指定了目标比例，则居中裁剪 + 缩放到目标尺寸
+    if target_w > 0 and target_h > 0:
+        img = crop_to_aspect(img, target_w, target_h)
+        img = img.resize((target_w, target_h), Image.LANCZOS)
+
+    img.save(str(out_path), "PNG")
     print(f"  ✅ 已保存：{out_path.name}（{out_path.stat().st_size // 1024} KB）")
+
+
+def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """居中裁剪到目标宽高比（不缩放，只裁切）"""
+    target_ratio = target_w / target_h
+    w, h = img.size
+    ratio = w / h
+
+    if ratio > target_ratio:
+        # 比目标更宽 → 裁左右
+        new_w = int(h * target_ratio)
+        x0 = (w - new_w) // 2
+        return img.crop((x0, 0, x0 + new_w, h))
+    else:
+        # 比目标更高 → 裁上下
+        new_h = int(w / target_ratio)
+        y0 = (h - new_h) // 2
+        return img.crop((0, y0, w, y0 + new_h))
 
 
 def gen_infographic_prompt(topic: str, hint: str) -> str:
@@ -163,19 +209,27 @@ def main():
         print(f"   配图{i}：{p}")
 
     # 生成 3 张配图
+    # wanx-v1 仅支持: 1024*1024 / 720*1280 / 768*1152 / 1280*720
+    # 用最接近比例的接口尺寸生成，再裁到目标比例
     print(f"\n🖼️  生成 3 张配图...")
-    size_map = ["1024*1536", "1024*1536", "1536*1024"]
-    for i, (hint, size) in enumerate(zip(info['img_prompts'], size_map), 1):
+    # (接口尺寸, 目标宽, 目标高)
+    size_specs = [
+        ("768*1152", 1024, 1536),   # 配图1 竖图 (2:3)
+        ("768*1152", 1024, 1536),   # 配图2 竖图 (2:3)
+        ("1280*720", 1536, 1024),   # 配图3 横图 (3:2)
+    ]
+    for i, (hint, (api_size, tw, th)) in enumerate(zip(info['img_prompts'], size_specs), 1):
         topic = info['title'] or hint or "认知升级"
         prompt = gen_infographic_prompt(topic, hint)
         out_path = ARTICLES_DIR / f"{args.date}_配图{i}.png"
-        gen_one_image(api_key, prompt, size, out_path)
+        gen_one_image(api_key, prompt, api_size, out_path, target_w=tw, target_h=th)
 
     # 生成封面
     print(f"\n🎬  生成封面...")
     cover_prompt = gen_cover_prompt(info['title'], info['sub_title'], info['title'])
     cover_path = ARTICLES_DIR / f"{args.date}_封面.png"
-    gen_one_image(api_key, cover_prompt, "2048*870", cover_path)
+    # 封面 2048×870 (2.35:1)，用最接近接口尺寸 1280*720 生成后裁到 2048*870
+    gen_one_image(api_key, cover_prompt, "1280*720", cover_path, target_w=2048, target_h=870)
 
     print(f"\n✅ 所有图片已生成")
 

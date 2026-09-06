@@ -2,3 +2,4 @@
 requests>=2.31.0
 openai>=1.0.0          # DeepSeek API 兼容 OpenAI SDK
 dashscope>=1.20.0      # 通义万相（图片生成）
+pillow>=10.0.0         # 图片裁剪/缩放（wanx 只支持固定分辨率，需裁到目标比例）
