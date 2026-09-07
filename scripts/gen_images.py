@@ -68,76 +68,96 @@ def parse_md_for_image_prompts(date: str) -> dict:
     }
 
 
+def _submit_task(prompt: str, size: str, n: int = 1, retries: int = 3):
+    """用 async_call 提交任务，返回 task_id。提交失败重试（不扣费，因为没拿到任务）"""
+    for attempt in range(1, retries + 1):
+        try:
+            rsp = ImageSynthesis.async_call(
+                model="wanx-v1",
+                prompt=prompt,
+                n=n,
+                size=size,
+            )
+            if rsp.status_code == 200 and getattr(rsp.output, "task_id", None):
+                return rsp.output.task_id
+            # 非 200 但有 code：直接返回错误信息
+            if rsp.status_code != 200:
+                msg = getattr(rsp, "message", "") or getattr(rsp, "code", "")
+                print(f"    ⚠️ 提交返回非 200：{rsp.code} - {msg}")
+                if attempt < retries:
+                    time.sleep(8 * attempt)
+                    continue
+                return None
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ProtocolError,
+                TimeoutError) as e:
+            print(f"    ⚠️ 第 {attempt}/{retries} 次提交网络错（{type(e).__name__}），重试...")
+            if attempt < retries:
+                time.sleep(8 * attempt)
+                continue
+            return None
+    return None
+
+
+def _poll_task(task_id: str, max_waits: int = 12, poll_interval: int = 15):
+    """用 fetch 轮询任务状态，返回 (results, status)。网络错则退避重试（同一 task，不重复扣费）"""
+    last_status = "PENDING"
+    for i in range(1, max_waits + 1):
+        try:
+            rsp = ImageSynthesis.fetch(task_id)
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ProtocolError,
+                TimeoutError) as e:
+            print(f"    ⚠️ 第 {i}/{max_waits} 次查询网络错（{type(e).__name__}），{poll_interval}s 后重查")
+            time.sleep(poll_interval)
+            continue
+
+        if rsp.status_code != 200:
+            print(f"    ⚠️ 查询返回非 200：{rsp.code} - {rsp.message}")
+            time.sleep(poll_interval)
+            continue
+
+        status = getattr(rsp.output, "task_status", "RUNNING")
+        last_status = status
+        if status == "SUCCEEDED":
+            results = getattr(rsp.output, "results", None)
+            return results, status
+        elif status == "FAILED":
+            print(f"    ❌ 任务失败：{getattr(rsp, 'code', '')} - {getattr(rsp, 'message', '')}")
+            return None, status
+        # PENDING / RUNNING：继续等
+        if i % 3 == 0:
+            print(f"    任务 {status}，已等 {i * poll_interval}s ...")
+        time.sleep(poll_interval)
+
+    print(f"    ❌ 轮询超时（{max_waits * poll_interval}s），最后状态 {last_status}")
+    return None, last_status
+
+
 def gen_one_image(api_key: str, prompt: str, size: str, out_path: Path,
                   target_w: int = 0, target_h: int = 0, n: int = 1):
-    """调通义万相生成一张图（异步两段式 + 重试），并按目标比例居中裁剪缩放
+    """调通义万相生成一张图（async_call 提交 + fetch 轮询，全链路重试），再裁到目标比例
 
-    重试策略（关键：避免重复扣费）：
-    - 第一次 `call()` 提交任务，拿到 task_id 后服务端就开始算
-    - 轮询 `wait()` 超时（网络抖动/服务端慢）→ 不要重提交 → sleep 后再用同一 task_id 查
-    - 4 次轮询都拿不到结果 → 才视为本次生成失败（不影响其他图）
+    关键设计（避免重复扣费）：
+    - async_call() 只提交任务、立即返回 task_id，不阻塞等待 → 提交失败可安全重试（没扣费）
+    - fetch() 每次查状态都轻量、独立 → 网络抖动只影响这一次查询，重查同一 task 即可
+    - 全程不重复提交任务，同一 task 只扣一次费
     """
     dashscope.api_key = api_key
 
     print(f"  🎨 生成 {out_path.name}（接口尺寸 {size}）...")
-    # wanx-v1 为异步模型：call() 只创建任务并返回 task_id
-    rsp = ImageSynthesis.call(
-        model="wanx-v1",
-        prompt=prompt,
-        n=n,
-        size=size,
-    )
-
-    if rsp.status_code != 200:
-        print(f"❌ 提交失败：{rsp.code} - {rsp.message}")
+    task_id = _submit_task(prompt, size, n=n)
+    if not task_id:
+        print(f"  ❌ 提交任务失败，已重试多次，跳过此图")
         sys.exit(1)
 
-    task_id = getattr(rsp.output, "task_id", None)
-    if not task_id:
-        # 同步结果路径（理论不会发生，wanx-v1 必然异步）
-        results = getattr(rsp.output, "results", None)
-        if not results:
-            print(f"❌ 未返回图片结果（code={rsp.code} message={rsp.message}）")
-            sys.exit(1)
-    else:
-        # 异步：用同一 task_id 多次轮询 wait()
-        # 关键：wait 超时（网络抖动）不要重提交，避免重复扣费
-        print(f"    任务已提交（{task_id}），轮询结果...")
-        results = None
-        max_polls = 4
-        for i in range(1, max_polls + 1):
-            try:
-                rsp = ImageSynthesis.wait(task_id)
-            except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError,
-                    TimeoutError) as e:
-                # 网络/超时：服务端可能还在生成，等一会再查同一 task
-                wait_s = 20 * i
-                print(f"    ⚠️ 第 {i}/{max_polls} 次轮询超时/网络错（{type(e).__name__}），"
-                      f"{wait_s}s 后再用同一任务查询（不重提交，避免重复扣费）")
-                if i < max_polls:
-                    time.sleep(wait_s)
-                    continue
-                else:
-                    print(f"❌ 多次轮询均失败，请稍后再试或去 dashscope 控制台查任务状态")
-                    sys.exit(1)
-
-            # 正常返回
-            if rsp.status_code != 200:
-                print(f"❌ 任务失败：{rsp.code} - {rsp.message}")
-                sys.exit(1)
-            results = getattr(rsp.output, "results", None)
-            if results:
-                break
-            # results 仍为空（任务未完成），再等再查
-            wait_s = 15 * i
-            print(f"    第 {i}/{max_polls} 次轮询：任务未完成，{wait_s}s 后重试")
-            if i < max_polls:
-                time.sleep(wait_s)
-
-        if not results:
-            print(f"❌ 多次轮询后仍未拿到结果（code={rsp.code} message={rsp.message}）")
-            sys.exit(1)
+    print(f"    任务已提交（{task_id}），轮询中...")
+    results, status = _poll_task(task_id)
+    if not results:
+        print(f"  ❌ 任务未成功（状态 {status}），跳过此图")
+        sys.exit(1)
 
     url = results[0].url
     print(f"    下载图片...")
